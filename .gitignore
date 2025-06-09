@@ -1,0 +1,61 @@
+# === R-related ===
+*.Rproj
+*.RData
+*.rda
+*.rds
+*.Rhistory
+*.Rapp.history
+.Rproj.user/
+cache/
+*.html
+*.pdf
+*.png
+*.jpeg
+*.jpg
+*.bmp
+*.svg
+
+# Prevent knitr-generated files from being included
+*_cache/
+*_files/
+*.utf8.md
+
+# === Python-related ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints/
+*.log
+
+# Common data files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.xml
+*.parquet
+*.feather
+*.hdf5
+*.db
+*.sqlite
+*.out
+*.txt
+
+# Figures/results
+figures/
+results/
+outputs/
+*.npy
+*.npz
+*.mat
+
+# IDE / system-specific
+.DS_Store
+Thumbs.db
+.env
+.venv/
+.conda/
+env/
+venv/
