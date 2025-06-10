@@ -1,0 +1,487 @@
+---
+title: "Cox model 2nd approach"
+output: html_document
+date: "2025-04-23"
+---
+```{r setup, include=FALSE, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+Load libraries
+```{r}
+library(survival)
+library(survminer)
+library(splines)
+library(corrplot)
+library(readr)
+library(dplyr)
+library(RColorBrewer)
+library(rlang)
+```
+Load generated dataframe
+```{r}
+input_cox_trend <- read_rds("/home/niclas/input_cox_trend.rds")
+```
+setting refernce levels for categorical data for better readability
+```{r}
+input_cox_trend$'smoking_status' <- relevel(input_cox_trend$'smoking_status', ref = "No smoker")
+input_cox_trend$'alcohol_risk_consumption' <- relevel(input_cox_trend$'alcohol_risk_consumption', ref = "No risk consumption")
+input_cox_trend$'cat_eGFR' <- relevel(input_cox_trend$'cat_eGFR', ref = "normal value")
+```
+# Create and run Cox model benchmark
+Create survival object
+```{r}
+surv_object <- Surv(input_cox_trend$time_to_event, input_cox_trend$event)
+```
+Fit Cox Proportional Hazards model
+```{r}
+cox_model <- coxph(surv_object ~ .-time_to_event -event, data = input_cox_trend)
+summary(cox_model)  
+```
+Automatically determines which covariates to keep based on AIC
+```{r}
+step(cox_model)
+```
+Fit model and manually include/exclude columns --> adjusted to step()
+```{r}
+cox_model <- coxph(formula = surv_object ~ delta_last + val_HbA1c + sexe + 
+    age + smoking_status + qmedea + hypertension + dyslipidemia + 
+    ischemic_heart_disease + chronic_kidney_disease + BMI + diastolic_blood_pressure + 
+    triglycerides + ACR + cat_eGFR, data = input_cox_trend)
+summary(cox_model)
+```
+Correlation plot
+Extract the right-hand side (covariates only)
+```{r}
+vars <- all.vars(delete.response(terms(cox_model)))  # removes Surv() or surv_object
+cox_vars <- input_cox_trend[, vars]
+numeric_vars <- cox_vars[, sapply(cox_vars, is.numeric)]
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         title = "Correlation Plot of Cox Model Covariates", mar = c(0,0,2,0))
+```
+# Checking assumptions of model
+# 1. Test for proportional hazards assumption
+```{r}
+cox.zph(cox_model)
+```
+Plot Schoenfeld residuals
+```{r}
+plot(cox.zph(cox_model))
+```
+PLot cumulative log-log plots (only for categorical) using a formula
+```{r}
+cloglog_plot <- function(cox_model, df, var) {
+  # Get the name of the cox_model object
+  model_name <- deparse(substitute(cox_model))
+  
+  # Create a temporary clean variable name
+  df$.__temp__var <- df[[var]]
+
+  # Fit Kaplan-Meier model using the temporary variable
+  km_fit <- survfit(Surv(time_to_event, event) ~ .__temp__var, data = df)
+
+  # Plot cloglog survival curves
+  ggsurvplot(
+    km_fit,
+    data = df,
+    fun = function(s) log(-log(s)),
+    palette = "Dark2",
+    legend.title = var,
+    legend.labs = levels(df[[var]]),
+    xlab = "Time (log scale)",
+    ylab = "log(-log(Survival))",
+    title = paste("C-Log-Log Plot for", var, "in", model_name)
+  )
+}
+```
+Using the function for categorical values
+```{r, error = TRUE, message = TRUE, warning = TRUE}
+cloglog_plot(cox_model, input_cox_trend, "sexe")
+cloglog_plot(cox_model, input_cox_trend, "smoking_status")
+cloglog_plot(cox_model, input_cox_trend, "alcohol_risk_consumption")
+cloglog_plot(cox_model, input_cox_trend, "qmedea")
+cloglog_plot(cox_model, input_cox_trend, "hypertension")
+cloglog_plot(cox_model, input_cox_trend, "dyslipidemia")
+cloglog_plot(cox_model, input_cox_trend, "peripheral_artey_disease")
+cloglog_plot(cox_model, input_cox_trend, "chronic_kidney_disease")
+```
+# 2. Test for linearity of log-hazard --> complete model
+```{r}
+plot(predict(cox_model), residuals(cox_model, type="martingale"),
+      xlab="fitted values", ylab="Martingale residuals", main="Residual plot", las=1)
+abline(h = 0, col = "red")
+lines(smooth.spline(predict(cox_model),
+        residuals(cox_model, type="martingale")), col="blue")
+```
+Function to check log-linearity for each NUMERICAL covariate
+```{r}
+check_log_linearity <- function(cox_model, df, covariate, max_plot_points = 1000, max_spline_points = 200) {
+  # Full data
+  x_all <- df[[covariate]]
+  y_all <- residuals(cox_model, type = "martingale")
+  
+  # Optionally reduce number of points plotted (scatter), but keep full data for spline
+  if (length(x_all) > max_plot_points) {
+    idx_plot <- sample(seq_along(x_all), max_plot_points)
+    x_plot <- x_all[idx_plot]
+    y_plot <- y_all[idx_plot]
+  } else {
+    x_plot <- x_all
+    y_plot <- y_all
+  }
+  
+  # Base plot
+  plot(x_plot, y_plot, xlab = "", ylab = "", axes = TRUE)
+  abline(h = 0, col = "red", lwd = 2)
+  
+  # Full spline (computed on full data)
+  spline_fit <- smooth.spline(x_all, y_all)
+  
+  # Downsample spline points before plotting
+  x_spline <- spline_fit$x
+  y_spline <- spline_fit$y
+  
+  if (length(x_spline) > max_spline_points) {
+    idx_spline <- round(seq(1, length(x_spline), length.out = max_spline_points))
+    lines(x_spline[idx_spline], y_spline[idx_spline], col = "blue", lwd = 2)
+  } else {
+    lines(x_spline, y_spline, col = "blue", lwd = 2)
+  }
+  
+  # Add variable name as bottom label
+  mtext(covariate, side = 1, line = 2, cex = 1)
+}
+
+```
+Check for numerical covariates
+```{r}
+check_log_linearity(cox_model, input_cox_trend, "val_HbA1c")
+check_log_linearity(cox_model, input_cox_trend, "age")
+check_log_linearity(cox_model, input_cox_trend, "BMI")
+check_log_linearity(cox_model, input_cox_trend, "diastolic_blood_pressure")
+check_log_linearity(cox_model, input_cox_trend, "triglycerides")
+check_log_linearity(cox_model, input_cox_trend, "ACR")
+check_log_linearity(cox_model, input_cox_trend, "delta_last")
+```
+Creating one single output
+```{r}
+covariates <- c("val_HbA1c", "age", "BMI",
+                "diastolic_blood_pressure",
+                "triglycerides", "ACR", "delta_last")
+
+# Save to optimized PDF
+pdf("final_plots/log-linearity_violations_trend.pdf", width = 10, height = 8)
+par(mfrow = c(4, 2), mar = c(4, 2, 2, 1))
+
+for (var in covariates) {
+  check_log_linearity(cox_model, input_cox_trend, var)
+}
+
+dev.off()
+```
+# 3. Test for independence of survival times
+Fit Cox model with frailty term for qmedea
+```{r}
+cox_frailty <- coxph(surv_object ~ val_HbA1c + sexe + age + smoking_status + 
+    alcohol_risk_consumption + hypertension + peripheral_artey_disease + 
+    ischemic_heart_disease + chronic_kidney_disease + BMI + systolic_blood_pressure + 
+    diastolic_blood_pressure + cholesterol_LDL + triglycerides + 
+    ACR + frailty(qmedea), data = input_cox_trend)
+```
+Compare standard and frailty models using AIC
+```{r}
+aic_standard <- AIC(cox_model)
+aic_frailty <- AIC(cox_frailty)
+cat("AIC (Standard model):", aic_standard, "\n")
+cat("AIC (Frailty model):", aic_frailty, "\n")
+```
+# Steps to improve model
+1 Fix log-linearity usinf natural splines ns
+```{r}
+cox_model_upd <- coxph(formula = surv_object ~ ns(delta_last, df=8) + ns(val_HbA1c, df=8) + sexe + 
+    ns(age, df=8) + smoking_status + qmedea + hypertension + dyslipidemia + 
+    ischemic_heart_disease + chronic_kidney_disease + ns(BMI, df=8) + ns(diastolic_blood_pressure, df=8) + 
+    ns(triglycerides, df=8) + ns(ACR, df=8) + cat_eGFR, data = input_cox_trend)
+summary(cox_model_upd) 
+```
+Test for linearity of log-hazard updated model --> complete model
+```{r}
+plot(predict(cox_model_upd), residuals(cox_model_upd, type="martingale"),
+      xlab="fitted values", ylab="Martingale residuals", main="Residual plot", las=1)
+abline(h = 0, col = "red")
+lines(smooth.spline(predict(cox_model_upd),
+        residuals(cox_model_upd, type="martingale")), col="blue")
+```
+Creating one single output of updated model
+```{r}
+covariates <- c("val_HbA1c", "age", "BMI",
+                "diastolic_blood_pressure",
+                "triglycerides", "ACR", "delta_last")
+
+# Save to optimized PDF
+pdf("final_plots/log-linearity_violations_fixed_trend.pdf", width = 10, height = 8)
+par(mfrow = c(4, 2), mar = c(4, 2, 2, 1))
+
+for (var in covariates) {
+  check_log_linearity(cox_model_upd, input_cox_trend, var)
+}
+
+dev.off()
+```
+Assumption 2 for updated model
+Check for numerical covariates of updated model
+```{r}
+check_log_linearity(cox_model_upd, input_cox_trend, "val_HbA1c")
+check_log_linearity(cox_model_upd, input_cox_trend, "age")
+check_log_linearity(cox_model_upd, input_cox_trend, "BMI")
+check_log_linearity(cox_model_upd, input_cox_trend, "systolic_blood_pressure")
+check_log_linearity(cox_model_upd, input_cox_trend, "diastolic_blood_pressure")
+check_log_linearity(cox_model_upd, input_cox_trend, "cholesterol_LDL")
+check_log_linearity(cox_model_upd, input_cox_trend, "triglycerides")
+check_log_linearity(cox_model_upd, input_cox_trend, "ACR")
+```
+Test for proportional hazards assumption of updated model
+```{r}
+cox.zph(cox_model_upd)
+```
+Actual step 2: Fix PH violations
+Turning covariates into time-interactions terms
+Starting by tuning 5 biggest violators and assuming log in tt-function --> DOES NOT WORK 
+cox_model_ns_tt <- coxph(surv_object ~ sexe + ns(age, df=8) + tt(age) + `smoking status` + `alcohol risk consumption` + 
+    qmedea + hypertension + dyslipidemia + 
+    `peripheral artery disease` +  
+    `chronic kidney disease` + ns(BMI, df=4) + tt(BMI) + `Systolic blood pressure` + 
+    `Diastolic blood pressure` + tt(`Diastolic blood pressure`) + ns(`cholesterol LDL`, df=4) + tt(`cholesterol LDL`)
+    + ns(triglycerides, df=8) + tt(triglycerides)  + ns(ACR, df=8) + Drug_A10BD07 + Drug_A10BD08 + Drug_A10BD20, 
+    data = input_cox_trend, tt=function(x,t,...) x * log(t) )
+summary(cox_model_ns_tt)
+
+
+test working of tt --> DOES NOT WORK
+cox_model_tt_test <- coxph(surv_object ~ sexe + ns(age, df=8) + `smoking status` + `alcohol risk consumption` + 
+    qmedea + hypertension + dyslipidemia + 
+    `peripheral artery disease` +  
+    `chronic kidney disease` + ns(BMI, df=4) + tt(`Systolic blood pressure`) + 
+    `Diastolic blood pressure` + ns(`cholesterol LDL`, df=4) + ns(triglycerides, df=8) + 
+    ns(ACR, df=8) + Drug_A10BD07 + Drug_A10BD08 + Drug_A10BD20, 
+    data = input_cox_trend, tt=function(x,t,...) x * t)
+summary(cox_model_tt_test)
+DOES NOT WORK --> MEM IS MAXED OUT  
+cox_model_tt_test <- coxph(surv_object ~ sexe + age + `smoking status` + `alcohol risk consumption` + 
+    qmedea + hypertension + dyslipidemia + 
+    `peripheral artery disease` +  
+    `chronic kidney disease` + BMI + tt(`Systolic blood pressure`) + 
+    `Diastolic blood pressure` + `cholesterol LDL` + triglycerides + 
+    ACR + Drug_A10BD07 + Drug_A10BD08 + Drug_A10BD20, 
+    data = input_cox_trend, tt=function(x,t,...) x * t)
+    
+
+# NEW APPROACH: Combination of ns() and factors
+```{r}
+input_cox_trend$time_to_event <- input_cox_trend$time_to_event + 0.0001
+```
+Splitting data by time-inertvals
+```{r}
+input_split <- survSplit(Surv(time_to_event, event) ~.,
+                  data = input_cox_trend,
+                  cut = c(1600, 3200),
+                  episode = "interval")
+```
+Generate natural spline basis for log-lin violating covariates
+```{r}
+ns_HbA1c <- ns(input_split$`val_HbA1c`, df = 8)
+input_split$ns_HbA1c1 <- ns_HbA1c[,1]
+input_split$ns_HbA1c2 <- ns_HbA1c[,2]
+input_split$ns_HbA1c3 <- ns_HbA1c[,3]
+input_split$ns_HbA1c4 <- ns_HbA1c[,4]
+input_split$ns_HbA1c5 <- ns_HbA1c[,5]
+input_split$ns_HbA1c6 <- ns_HbA1c[,6]
+input_split$ns_HbA1c7 <- ns_HbA1c[,7]
+input_split$ns_HbA1c8 <- ns_HbA1c[,8]
+
+ns_age <- ns(input_split$age, df = 8)
+input_split$ns_age1 <- ns_age[,1]
+input_split$ns_age2 <- ns_age[,2]
+input_split$ns_age3 <- ns_age[,3]
+input_split$ns_age4 <- ns_age[,4]
+input_split$ns_age5 <- ns_age[,5]
+input_split$ns_age6 <- ns_age[,6]
+input_split$ns_age7 <- ns_age[,7]
+input_split$ns_age8 <- ns_age[,8]
+
+ns_bmi <- ns(input_split$BMI, df = 4)
+input_split$ns_bmi1 <- ns_bmi[,1]
+input_split$ns_bmi2 <- ns_bmi[,2]
+input_split$ns_bmi3 <- ns_bmi[,3]
+input_split$ns_bmi4 <- ns_bmi[,4]
+
+ns_trig <- ns(input_split$triglycerides, df = 8)
+input_split$ns_trig1 <- ns_trig[,1]
+input_split$ns_trig2 <- ns_trig[,2]
+input_split$ns_trig3 <- ns_trig[,3]
+input_split$ns_trig4 <- ns_trig[,4]
+input_split$ns_trig5 <- ns_trig[,5]
+input_split$ns_trig6 <- ns_trig[,6]
+input_split$ns_trig7 <- ns_trig[,7]
+input_split$ns_trig8 <- ns_trig[,8]
+
+ns_acr <- ns(input_split$ACR, df = 8)
+input_split$ns_acr1 <- ns_acr[,1]
+input_split$ns_acr2 <- ns_acr[,2]
+input_split$ns_acr3 <- ns_acr[,3]
+input_split$ns_acr4 <- ns_acr[,4]
+input_split$ns_acr5 <- ns_acr[,5]
+input_split$ns_acr6 <- ns_acr[,6]
+input_split$ns_acr7 <- ns_acr[,7]
+input_split$ns_acr8 <- ns_acr[,8]
+
+ns_delta_last <- ns(input_split$delta_last, df = 8)
+input_split$ns_delta_last1 <- ns_delta_last[,1]
+input_split$ns_delta_last2 <- ns_delta_last[,2]
+input_split$ns_delta_last3 <- ns_delta_last[,3]
+input_split$ns_delta_last4 <- ns_delta_last[,4]
+input_split$ns_delta_last5 <- ns_delta_last[,5]
+input_split$ns_delta_last6 <- ns_delta_last[,6]
+input_split$ns_delta_last7 <- ns_delta_last[,7]
+input_split$ns_delta_last8 <- ns_delta_last[,8]
+```
+Actual model call
+```{r}
+cox_model_comb <- coxph(Surv(tstart, time_to_event, event) ~ 
+
+  # Nonlinear + time-varying effects
+  (ns_HbA1c1 + ns_HbA1c2 + ns_HbA1c3 + ns_HbA1c4 + ns_HbA1c5 + ns_HbA1c6 + ns_HbA1c7 + ns_HbA1c8) * factor(interval) +
+  (ns_age1 + ns_age2 + ns_age3 + ns_age4 + ns_age5 + ns_age6 + ns_age7 + ns_age8) * factor(interval) +
+  (ns_bmi1 + ns_bmi2 + ns_bmi3 + ns_bmi4) * factor(interval) +
+  (ns_trig1 + ns_trig2 + ns_trig3 + ns_trig4 + ns_trig5 + ns_trig6 + ns_trig7 + ns_trig8) * factor(interval) +
+  (ns_acr1 + ns_acr2 + ns_acr3 + ns_acr4 + ns_acr5 + ns_acr6 + ns_acr7 + ns_acr8) * factor(interval) +
+  (ns_delta_last1 + ns_delta_last2 + ns_delta_last3 + ns_delta_last4 + ns_delta_last5 + ns_delta_last6 + ns_delta_last7 + ns_delta_last8) * factor(interval) +
+
+  # Time-varying categorical / linear covariates
+  sexe * factor(interval) +
+  dyslipidemia * factor(interval) +
+  chronic_kidney_disease * factor(interval) +
+  diastolic_blood_pressure * factor(interval) +
+
+
+  # Proportional + linear covariates (no violation)
+  smoking_status +
+  qmedea +
+  hypertension +
+  ischemic_heart_disease,
+  data = input_split)
+  
+summary(cox_model_comb)
+```
+PH assumptions
+```{r}
+cox.zph(cox_model_comb)
+```
+plot(cox.zph(cox_model_comb)) --> DO NOT COMPILE --> too many useless plots
+
+Test for linearity of combined updated model 
+```{r}
+plot(predict(cox_model_comb), residuals(cox_model_comb, type="martingale"),
+      xlab="fitted values", ylab="Martingale residuals", main="Residual plot", las=1)
+      abline(h = 0, col = "red")
+      lines(smooth.spline(predict(cox_model_comb),
+      residuals(cox_model_comb, type="martingale")), col="blue")
+```
+Reverse-engineering for simplest call
+```{r}
+library(Hmisc)
+
+surv_object <- Surv(time = input_cox_trend$time_to_event, event = input_cox_trend$event)
+# Variables ranked by absolute z-value from output of simple call earlier
+var_ranked <- c("val_HbA1c", "delta_last", "age", "sexe", "smoking_status", 
+                "qmedea", "BMI", "diastolic_blood_pressure" , "hypertension", 
+                "dyslipidemia", "ischemic_heart_disease",
+                "chronic_kidney_disease", "cat_eGFR", "triglycerides", "ACR")
+
+# Define step sizes: 1, 3, 5, ..., up to all variables
+step_sizes <- seq(1, length(var_ranked), by = 1)
+if (tail(step_sizes, 1) != length(var_ranked)) {
+  step_sizes <- c(step_sizes, length(var_ranked))  # ensure all variables included
+}
+```
+Loop through models with increasing variables
+```{r}
+results <- data.frame(n_vars = integer(), c_index = numeric(), variables = character())
+
+for (k in step_sizes) {
+  vars_k <- var_ranked[1:k]
+  formula_k <- as.formula(paste("Surv(time_to_event, event) ~", paste(vars_k, collapse = " + ")))
+  model_k <- coxph(formula_k, data = input_cox_trend)
+  pred_k <- predict(model_k, type = "lp")
+  ci_k <- 1 - rcorr.cens(pred_k, Surv(input_cox_trend$time_to_event, input_cox_trend$event))[1]
+  results <- rbind(results, data.frame(n_vars = k,
+                                       c_index = ci_k,
+                                       variables = paste(vars_k, collapse = ", ")))
+}
+print(results)
+```
+Plotting of results
+```{r}
+p <- ggplot(results, aes(x = n_vars, y = c_index)) +
+  geom_line(color = "steelblue4", size = 1.2) +
+  geom_point(color = "steelblue4", size = 2.5) +
+  theme_minimal() +
+  labs(x = "Number of Variables", y = "C-Index") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12, face = "bold"),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 13),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin = margin(t = 30, b = 30)
+  )
+print(p)
+ggsave(paste0("final_plots/influence_number_of_variables_trend.pdf"), width = 6, height = 4, units = "in")
+```
+Separation power of categorical variables
+Function to plot Kaplan-Meier estimates
+```{r}
+plot_separation_km <- function(df, factor_col, output_path = "km_plot.pdf") {
+  formula_str <- as.formula(paste("Surv(time_to_event, event) ~", factor_col))
+  fit <- survfit(formula_str, data = df)
+
+  # Get number of levels for color palette
+  n_levels <- length(levels(df[[factor_col]]))
+  if (n_levels <= 9) {
+    colors <- brewer.pal(n_levels, "Blues")
+  } else {
+    colors <- colorRampPalette(brewer.pal(9, "Blues"))(n_levels)
+  }
+  pdf(output_path, width = 8, height = 6)
+  # Plot
+  plot(fit,
+       col = colors,
+       lwd = 2.5,
+       xlab = "Time",
+       ylab = "Survival Probability",
+       mark.time = TRUE)
+
+  legend("bottomleft",
+         legend = levels(df[[factor_col]]),
+         col = colors,
+         lty = 1,
+         lwd = 2.5,
+         bty = "n")
+
+  dev.off()
+}
+```
+Calling of function
+```{r}
+plot_separation_km(input_cox_trend, factor_col = "smoking_status", output_path= "final_plots/input_cox_trend_separation/separation_smoking_status_trend.pdf")
+plot_separation_km(input_cox_trend, factor_col = "alcohol_risk_consumption", output_path= "final_plots/input_cox_trend_separation/separation_alcohol_risk_cosumption_trend.pdf")
+plot_separation_km(input_cox_trend, factor_col = "sexe", output_path= "final_plots/input_cox_trend_separation/separation_sexe_trend.pdf")
+plot_separation_km(input_cox_trend, factor_col = "qmedea", output_path= "final_plots/input_cox_trend_separation/separation_qmedea_trend.pdf")
+plot_separation_km(input_cox_trend, factor_col = "cat_eGFR", output_path= "final_plots/input_cox_trend_separation/separation_cat_eGFR_trend.pdf")
+```
+
+
+
+
