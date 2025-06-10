@@ -1,0 +1,695 @@
+---
+title: "Section_data_preparation"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-05-07"
+---
+```{r setup, include=FALSE, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+Load libraries
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(rlang)
+library(scales)
+library(gridExtra)
+library(grid)
+library(summarytools)
+library(skimr)
+library(tidyr)
+library(grDevices)
+library(forcats)
+```
+## Filtering for HbA1c from SIDIAP and pass to Python-file
+# 1st approach with earliest prediabetic entry
+Extracting HBA1c data from SIDIAP database --> variables_analitiques and categorizing it
+```{r}
+data_variables_analitiques <- read_rds("/home/dadesSP_berta75/taulesSIDIAP/taulesSIDIAP/ERC_ERC_DM_entregable_variables_analitiques_20240409_202620.rds")
+data_HbA1c <- data_variables_analitiques %>%
+  filter(grepl("HBA1C",cod))
+data_HbA1c <- data_HbA1c %>%
+  filter(!is.na(val)) %>%  # Ignore NA values
+  mutate(cat.hyperglycemia = cut(val, 
+                        breaks = c(-Inf, 5.7, 6.5, Inf),  
+                        labels = c("Normal Level", "Prediabetic Level", "Diabetic Level"), 
+                        right = TRUE)) 
+```
+Create summary table   
+```{r}
+summary_table <- data_HbA1c %>%  
+  group_by(cat.hyperglycemia) %>%
+  summarise(Count = n()) %>%
+  mutate(Percentage = round((Count / sum(Count)) * 100, 2))
+```
+Create new subset with only prediabetic subjects
+```{r}
+input_data_Hb <- data_HbA1c %>%
+  filter(cat.hyperglycemia == "Prediabetic Level") %>%
+  select(-cat.hyperglycemia)
+```
+Number of unique pIDs  
+```{r}
+num_unique_pIDs <- length(unique(input_data_Hb$idp))
+print(num_unique_pIDs)
+```
+Create new subset that contains unique pIDs with each earliest entry
+```{r}
+input_data_Hb <- input_data_Hb %>%
+  group_by(idp) %>%         # Group by ID
+  arrange(dat) %>%        # Arrange rows by Date within each ID
+  slice(1) %>%             # Select the first row (earliest date) for each ID
+  ungroup()                # Ungroup the dataframe
+```
+Only include first 4 columns in to be exported file
+```{r}
+input_data_Hb <- input_data_Hb[, 1:5]
+saveRDS(input_data_Hb, file = "/home/niclas/input_data_Hb.rds", compress=TRUE)
+```
+# 2nd approach with latest prediabetic entry
+Filter for HbA1c
+```{r}
+data_HbA1c <- data_variables_analitiques %>%
+  filter(grepl("HBA1C",cod))
+```
+
+```{r}
+data_HbA1c <- data_HbA1c%>%
+  filter(!is.na(val)) %>%  # Ignore NA values
+  mutate(cat.hyperglycemia = cut(val, 
+                        breaks = c(-Inf, 4.0, 5.7, 6.5, Inf),  
+                        labels = c("Hypoglucemic level", "Normal Level", "Prediabetic Level", "Diabetic Level"), 
+                        right = TRUE)) 
+```
+New filter logic
+```{r}
+# Step 1: Find date of first diabetic entry (if any)
+first_diabetic_dates <- data_HbA1c %>%
+  filter(cat.hyperglycemia == "Diabetic Level") %>%
+  group_by(idp) %>%
+  summarise(first_diabetic_date = min(dat), .groups = "drop")
+
+# Step 2: Filter original data to include only values BEFORE the first diabetic entry (if any)
+data_trend <- data_HbA1c %>%
+  left_join(first_diabetic_dates, by = "idp") %>%
+  filter(is.na(first_diabetic_date) | dat < first_diabetic_date) %>%  # strictly before diabetes
+  filter(cat.hyperglycemia %in% c("Prediabetic Level", "Normal Level")) %>%
+  filter(val > 0)
+
+# Step 3: For each idp, calculate metrics only if their last available category is "Prediabetic Level"
+input_data_trend <- data_trend %>%
+  group_by(idp) %>%
+  arrange(dat, .by_group = TRUE) %>%
+  filter(n() >= 3) %>%
+  mutate(last_cat = last(cat.hyperglycemia)) %>%
+  filter(last_cat == "Prediabetic Level") %>%
+  summarise(
+    value_mean = round(mean(val, na.rm = TRUE), 2),
+    delta_last = round(last(val) - nth(val, n() - 1), 2),
+    relative_change = round((last(val) - first(val)) / first(val), 4),
+    dat = last(dat),
+    val = last(val),
+    .groups = "drop"
+  )
+```
+Create new subset excluding diabetic subjects
+```{r}
+data_trend <- data_HbA1c %>%
+  filter(cat.hyperglycemia %in% c("Prediabetic Level", "Normal Level")) %>%
+  filter(val > 0)
+```
+Number of unique pIDs --> for comparison
+```{r}
+num_unique_pIDs <- length(unique(data_trend$idp))
+print(num_unique_pIDs)
+```
+Approach removing entries directly and selecting t0 as latest entry
+(creation of 3 variables)
+```{r}
+input_data_trend <- data_trend %>%
+  group_by(idp) %>%
+  arrange(dat, .by_group = TRUE) %>%
+  filter(n() >= 3) %>%
+  mutate(last_cat = last(cat.hyperglycemia)) %>%
+  summarise(
+    value_mean = round(mean(val, na.rm = TRUE), 2),
+    delta_last = round(last(val) - nth(val, n() - 1), 2),
+    relative_change = round((last(val) - first(val)) / first(val), 4),
+    dat = last(dat),
+    val = last(val),
+    last_cat = last(cat.hyperglycemia)
+  ) %>%
+  ungroup() %>%
+  filter(last_cat == "Prediabetic Level") %>%
+  select(-last_cat)
+```
+Number of unique pIDs --> for comparison
+```{r}
+num_unique_pIDs_after <- length(unique(input_data_trend$idp))
+print(num_unique_pIDs_after)
+```
+Saving file
+```{r}
+saveRDS(input_data_trend, file = "/home/niclas/input_data_trend.rds", compress=TRUE)
+```
+# Creation of subsets to accelearte filtering process in Python-files
+```{r}
+# Preparing alcohol risk column from variables_cliniques to shorten computational time
+data_ALRIS <- data_variables_cliniques %>%
+  filter(grepl("ALRIS",cod))
+  
+saveRDS(data_ALRIS, file = "/home/niclas/data_ALRIS.rds", compress=TRUE)
+
+# Preparing joint diagnostics dataframe with only 5 relevant columns to use for comorbidities
+data_both_diagnostics <- data_cmbdh_diagnostics [, 1:5]
+colnames(data_diagnostics) <- colnames(data_both_diagnostics)
+data_both_diagnostics <- rbind(data_both_diagnostics, data_diagnostics)
+
+saveRDS(data_both_diagnostics, file = "/home/niclas/data_both_diagnostics.rds", compress=TRUE)
+
+# Preparing BMI column from variables_cliniques to shorten computational time
+data_BMI <- data_variables_cliniques %>%
+  filter(grepl("TT103",cod))
+  
+saveRDS(data_BMI, file = "/home/niclas/data_BMI.rds", compress=TRUE)
+
+# Preparing column systolic blood pressure from variables cliniques to shorten computational time
+data_SysBP <- data_variables_cliniques %>%
+  filter(grepl("EK201",cod))
+  
+saveRDS(data_SysBP, file = "/home/niclas/data_SysBP.rds", compress=TRUE)
+
+# Preparing column diastolic blood pressure from variables cliniques to shorten computational time
+data_DiasBP <- data_variables_cliniques %>%
+  filter(grepl("EK202",cod))
+  
+saveRDS(data_DiasBP, file = "/home/niclas/data_DiasBP.rds", compress=TRUE)
+
+# Preparing column cholesterol LDL from variables analitiques to shorten computational time
+data_cLDL <- data_variables_analitiques %>%
+  filter(grepl("COLLDL",cod))
+  
+saveRDS(data_cLDL, file = "/home/niclas/data_cLDL.rds", compress=TRUE)
+
+# Preparing column triglycerides from variables analitiques to shorten computational time
+data_trigly <- data_variables_analitiques %>%
+  filter(grepl("TG",cod))
+  
+saveRDS(data_trigly, file = "/home/niclas/data_trigly.rds", compress=TRUE)
+
+# Preparing column eGFR from variables analitiques to shorten computational time
+data_eGFR <- data_variables_analitiques %>%
+  filter(grepl("MDRD",cod))
+  
+saveRDS(data_eGFR, file = "/home/niclas/data_eGFR.rds", compress=TRUE)
+
+# Preparing column ACR from variables analitiques to shorten computational time
+data_ACR <- data_variables_analitiques %>%
+  filter(grepl("CAC",cod))
+  
+saveRDS(data_ACR, file = "/home/niclas/data_ACR.rds", compress=TRUE)
+```
+## Receiving back generated files from Python-file
+# 1st approach
+Load dataframe generated in Python:"Preparation_input_data_Hb"
+```{r}
+df <- read_csv("/home/niclas/generated_input_data_Hb.csv")
+```
+Modify certain columns type of entries and their order
+```{r}
+df$sexe <- as.factor(df$sexe)
+df$smoking_status <- as.factor(df$smoking_status)
+df$alcohol_risk_consumption <- as.factor(df$alcohol_risk_consumption)
+df$ruralitat <- as.factor(df$ruralitat)
+df$qmedea <- as.factor(df$qmedea)
+df <- df %>%
+  mutate(
+    `smoking_status` = factor(`smoking_status`, 
+                              levels = c("No smoker", "Smoker", "Ex-smoker")),
+    `alcohol_risk_consumption` = factor(`alcohol_risk_consumption`,
+                                        levels = c("No risk consumption", 
+                                                   "Low risk consumption", 
+                                                   "High risk consumption")),
+    `sexe`= factor(`sexe`,
+                   levels = c("H", "D"), labels = c("Male", "Female"))
+  )
+```
+Changing variable eGFR into a categorical value
+```{r}
+df$cat_eGFR <- ifelse(df$eGFR == 60.1, "normal value", "abnormal value")
+df$cat_eGFR <- as.factor(df$cat_eGFR)
+#Remove numerical eGFR column permanently 
+df <- df %>% select(-all_of("eGFR"))
+dfSummary(df)
+```
+Investigating the frequency of NAs per ID to eliminate entries with a lot of NAs
+--> Excluding the columns of comorbidities
+Summarize the total number of NAs per ID for columns from the 7th onward + skipping comorbidities
+```{r}
+na_distribution_better <- df %>%
+  select(1, 7:9, 18:24) %>%  # Select ID column and columns without comorbidities
+  group_by(.[[1]]) %>%       # Group by ID (assumes ID is in the first column)
+  summarise(Total_NAs = sum(is.na(across(everything())))) %>% # Count total NAs per ID
+  ungroup()
+```
+Create a frequency table of how many IDs have a certain number of NAs
+```{r}
+na_freq_better <- na_distribution_better %>%
+  count(Total_NAs, name = "Number_of_IDs") %>%
+  arrange(Total_NAs)  # Ensure sorted order
+```
+Visualize the distribution of NAs per ID
+```{r}
+ggplot(na_freq_better, aes(x = Total_NAs, y = Number_of_IDs)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(x = "Number of total missing values per entry", y = "Number of entries") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels if needed
+  scale_y_continuous(labels = scales::comma) # Format y-axis numbers with commas
+```
+Save plot
+```{r}
+ggsave("final_plots/na_distribution.pdf", width = 6, height = 4, units = "in")
+```
+Excluding all entries with any NAs --> complete subset
+Use previously created `na_distribution_better` to filter IDs with == 0 NAs
+```{r}
+valid_ids <- na_distribution_better %>%
+  filter(Total_NAs == 0) %>%
+  pull(1)  # Extracts valid IDs
+  subset_df_complete <- df %>%
+  filter(.[[1]] %in% valid_ids)
+  dfSummary(subset_df_complete)
+```
+Relable missing values "NA" from qmedea as "Rural"
+```{r}
+subset_df_complete <- subset_df_complete %>%
+  mutate(qmedea = fct_expand(qmedea, "R"),  
+         qmedea = replace_na(qmedea, "R"))  
+```
+
+# 2nd approach
+Load dataframe generated in Python:"Preparation_input_data_Hb_trend"
+```{r}
+df_trend <- read_csv("/home/niclas/generated_input_data_trend_NEW.csv")
+```
+Modify certain columns type of entries
+```{r}
+df_trend$sexe <- as.factor(df_trend$sexe)
+df_trend$smoking_status <- as.factor(df_trend$smoking_status)
+df_trend$alcohol_risk_consumption <- as.factor(df_trend$alcohol_risk_consumption)
+df_trend$ruralitat <- as.factor(df_trend$ruralitat)
+df_trend$qmedea <- as.factor(df_trend$qmedea)
+df_trend <- df_trend %>%
+  mutate(
+    `smoking_status` = factor(`smoking_status`, 
+                              levels = c("No smoker", "Smoker", "Ex-smoker")),
+    `alcohol_risk_consumption` = factor(`alcohol_risk_consumption`,
+                                        levels = c("No risk consumption", 
+                                                   "Low risk consumption", 
+                                                   "High risk consumption")),
+    `sexe`= factor(`sexe`,
+                   levels = c("H", "D"), labels = c("Male", "Female"))
+  )
+```
+Changing variable eGFR into a categorical value
+```{r}
+df_trend$cat_eGFR <- ifelse(df_trend$eGFR == 60.1, "normal value", "abnormal value")
+df_trend$cat_eGFR <- as.factor(df_trend$cat_eGFR)
+#Remove numerical eGFR column permanently 
+df_trend <- df_trend %>% select(-all_of("eGFR"))
+dfSummary(df_trend)
+```
+Investigating the frequency of NAs per ID to eliminate entries with a lot of NAs
+--> Excluding the columns of comorbidities
+Summarize the total number of NAs per ID for columns from the 8th onward + skipping comorbidities
+```{r}
+na_distribution_trend <- df_trend %>%
+  select(1, 10:12, 21:27) %>%  # Select ID column and columns without comorbidities
+  group_by(.[[1]]) %>%       # Group by ID (assumes ID is in the first column)
+  summarise(Total_NAs = sum(is.na(across(everything())))) %>% # Count total NAs per ID
+  ungroup()
+```
+Create a frequency table of how many IDs have a certain number of NAs
+```{r}
+na_freq_trend <- na_distribution_trend %>%
+  count(Total_NAs, name = "Number_of_IDs") %>%
+  arrange(Total_NAs)  # Ensure sorted order
+```
+Visualize the distribution of NAs per ID
+```{r}
+ggplot(na_freq_trend, aes(x = Total_NAs, y = Number_of_IDs)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(x = "Number of total missing values per entry", y = "Number of entries") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels if needed
+  scale_y_continuous(labels = scales::comma) # Format y-axis numbers with commas
+```
+Save plot
+```{r}
+ggsave("final_plots/na_distribution_trend.pdf", width = 6, height = 4, units = "in")
+```
+Excluding all entries with any NAs --> complete subset
+Use previously created `na_distribution_better` to filter IDs with == 0 NAs
+```{r}
+valid_ids_trend <- na_distribution_trend %>%
+  filter(Total_NAs == 0) %>%
+  pull(1)  # Extracts valid IDs
+  subset_df_trend_complete <- df_trend %>%
+  filter(.[[1]] %in% valid_ids_trend)
+  dfSummary(subset_df_trend_complete)
+```
+Relable NA from qmedea as Rural
+```{r}
+subset_df_trend_complete <- subset_df_trend_complete %>%
+    mutate(qmedea = fct_expand(qmedea, "R"),  
+           qmedea = replace_na(qmedea, "R"))  
+```
+## Creating Cox input_file by adding event-intelligence
+Generating final input dataframe(s) for cox model 
+```{r}
+input_cox <- subset_df_complete
+input_cox_trend <- subset_df_trend_complete
+```
+Removing no longer needed columns
+```{r}
+columns_to_be_removed <- c("dnaix", "ruralitat")  
+input_cox <- input_cox %>% select(-all_of(columns_to_be_removed))
+input_cox_trend <- input_cox_trend %>% select(-all_of(columns_to_be_removed))
+```
+Reframing NAs from comorbidities as 0 --> Cox can`t handle NAs
+Reframing comorbidities as factors
+```{r}
+cols <- c("hypertension", "dyslipidemia", "heart_failure", 
+          "peripheral_artey_disease", "stroke", 
+          "ischemic_heart_disease", "chronic_kidney_disease")
+
+input_cox[cols] <- lapply(input_cox[cols], function(x) factor(replace(x, is.na(x), "0")))
+input_cox_trend[cols] <- lapply(input_cox_trend[cols], function(x) factor(replace(x, is.na(x), "0")))
+```
+Creation of extra columns event and time_to_event
+Event 1: Onset of TD2M --> to be taken from both diagnostics tables
+Event 0: Exit of Id --> to be taken from poblacio 
+Merging of both diagnostics tables(load them from SIDIAP)
+```{r}
+data_diagnostics <- read_rds("/home/dadesSP_berta75/taulesSIDIAP/taulesSIDIAP/ERC_ERC_DM_entregable_diagnostics_20240409_202620.rds")
+data_cmbdh_diagnostics <- read_rds("/home/dadesSP_berta75/taulesSIDIAP/taulesSIDIAP/ERC_ERC_DM_entregable_cmbdh_diagnostics_ics_20240409_202620.rds")
+data_both_diagnostics <- data_cmbdh_diagnostics [, 1:5]
+colnames(data_diagnostics) <- colnames(data_both_diagnostics)
+data_both_diagnostics <- rbind(data_both_diagnostics, data_diagnostics)
+subset_exit <- read_rds("/home/dadesSP_berta75/taulesSIDIAP/taulesSIDIAP/ERC_ERC_DM_entregable_poblacio_20240409_202620.rds")
+```
+Creation of TD2M subset
+```{r}
+subset_TD2M <- data_both_diagnostics%>%
+  filter(grepl("^E11\\.[0-9]{1,4}$", cod))
+```
+Formatting of date: Event 1
+```{r}
+# Convert numeric YYYYMMDD to character, ensuring no scientific notation
+subset_TD2M$dat <- as.character(subset_TD2M$dat)
+# Remove any potential spaces or anomalies
+subset_TD2M$dat <- trimws(subset_TD2M$dat)  # Removes leading/trailing spaces
+# Convert to Date format
+subset_TD2M$dat <- as.Date(subset_TD2M$dat, format = "%Y%m%d")
+```
+Formatting of date: Event 0
+```{r}
+# Convert numeric YYYYMMDD to character, ensuring no scientific notation
+subset_exit$sortida <- as.character(subset_exit$sortida)
+# Remove any potential spaces or anomalies
+subset_exit$sortida <- trimws(subset_exit$sortida)  # Removes leading/trailing spaces
+# Convert to Date format
+subset_exit$sortida <- as.Date(subset_exit$sortida, format = "%Y%m%d")
+```
+Event 1:Keeping only earliest entry
+```{r}
+subset_TD2M_earliest <- subset_TD2M %>%
+  group_by(idp) %>%
+  arrange(dat) %>%
+  slice(1) %>%
+  ungroup()
+```
+Event 1: Merging left-sided with dataframe(s)
+```{r}
+input_cox <- input_cox %>%
+  left_join(subset_TD2M_earliest %>% select(idp, cod, dat), by="idp")
+input_cox_trend <- input_cox_trend %>%
+  left_join(subset_TD2M_earliest %>% select(idp, cod, dat), by="idp")
+```
+Event 0: Merging left-sided with dataframe(s)
+```{r}
+input_cox <- input_cox %>%
+  left_join(subset_exit %>% select(idp, sortida), by="idp") 
+input_cox_trend <- input_cox_trend %>%
+  left_join(subset_exit %>% select(idp, sortida), by="idp") 
+```
+Creation column event
+```{r}
+input_cox <- input_cox %>%
+  mutate(
+    event = case_when(
+      !is.na(cod) ~ 1,  # If cod is not NA, assign 
+      TRUE ~ 0  # Else, assign 0
+    )
+  )
+input_cox_trend <- input_cox_trend %>%
+  mutate(
+    event = case_when(
+      !is.na(cod) ~ 1,  # If cod is not NA, assign 
+      TRUE ~ 0  # Else, assign 0
+    )
+  )
+```
+Creation column time_to_event 
+```{r}
+input_cox <- input_cox %>%
+  mutate(
+    time_to_event = case_when(
+      event == 1 ~ as.numeric(dat.y - dat.x),  # If new_column = 1, use dat.y - dat.x
+      TRUE ~ as.numeric(sortida - dat.x)  # Otherwise, use exit - dat.x
+    )
+  )
+input_cox_trend <- input_cox_trend %>%
+  mutate(
+    time_to_event = case_when(
+      event == 1 ~ as.numeric(dat.y - dat.x),  # If new_column = 1, use dat.y - dat.x
+      TRUE ~ as.numeric(sortida - dat.x)  # Otherwise, use exit - dat.x
+    )
+  )
+```
+Summaries
+```{r}
+dfSummary(input_cox)
+dfSummary(input_cox_trend)
+```
+Remove columns that are no longer needed
+```{r}
+columns_to_remove2 <- c("idp", "dat.x", "cod", "dat.y", "sortida")  
+input_cox <- input_cox %>% select(-all_of(columns_to_remove2))
+input_cox_trend <- input_cox_trend %>% select(-all_of(columns_to_remove2))
+```
+Filter out negative time_to_events 
+```{r}
+input_cox <- input_cox %>%
+  filter(time_to_event > 0)
+input_cox_trend <- input_cox_trend %>%
+  filter(time_to_event > 0)
+dfSummary(input_cox)
+dfSummary(input_cox_trend)
+```
+Reordering again for subsets for clean visulaizations
+```{r}
+subset_df_complete <- subset_df_complete %>%
+  mutate(
+    `smoking_status` = factor(`smoking_status`, 
+                              levels = c("No smoker", "Smoker", "Ex-smoker")),
+    `alcohol_risk_consumption` = factor(`alcohol_risk_consumption`,
+                                        levels = c("No risk consumption", 
+                                                   "Low risk consumption", 
+                                                   "High risk consumption"))
+  )
+subset_df_trend_complete <- subset_df_trend_complete %>%
+  mutate(
+    `smoking_status` = factor(`smoking_status`, 
+                              levels = c("No smoker", "Smoker", "Ex-smoker")),
+    `alcohol_risk_consumption` = factor(`alcohol_risk_consumption`,
+                                        levels = c("No risk consumption", 
+                                                   "Low risk consumption", 
+                                                   "High risk consumption"))
+  )
+```
+Function to visually compare categorical values
+```{r}
+visualization_categorical_compare <- function(data1, data2, column_name) {
+  
+  # Add approach labels
+  data1$Approach <- "Approach 1"
+  data2$Approach <- "Approach 2"
+  
+  # Combine data
+  combined_data <- rbind(
+    data1[, c(column_name, "Approach", "event")],
+    data2[, c(column_name, "Approach", "event")]
+  )
+  
+  # Convert event and category to factors
+  combined_data$Event <- factor(combined_data$event, labels = c("No Event", "Event"))
+  combined_data$Category <- as.factor(combined_data[[column_name]])
+
+  # Summarize counts
+  summary_data <- combined_data %>%
+    group_by(Approach, Event, Category) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(Approach, Event) %>%
+    mutate(Proportion = Count / sum(Count))
+
+  # Plot grouped bars
+  ggplot(summary_data, aes(x = Category, y = Proportion, fill = Event)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    facet_wrap(~ Approach) +
+    labs( x = NULL, y = "Proportion") +
+    theme_minimal() +
+    scale_fill_manual(values = c("No Event" = "steelblue4", "Event" = "steelblue1")) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank(), 
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  #ggsave(paste0("final_plots/comparing_", column_name, ".pdf"), width = 6, height = 4, units = "in")
+}
+```
+Usage
+```{r}
+visualization_categorical_compare(input_cox, input_cox_trend, "sexe")
+visualization_categorical_compare(input_cox, input_cox_trend, "smoking_status")
+visualization_categorical_compare(input_cox, input_cox_trend, "alcohol_risk_consumption")
+visualization_categorical_compare(input_cox, input_cox_trend, "qmedea")
+visualization_categorical_compare(input_cox, input_cox_trend, "cat_eGFR")
+```
+Function to visually compare numerical values
+```{r}
+visualization_numerical_compare <- function(data1, data2, column_name, unit_label = NULL) {
+  
+  # Tag approaches
+  data1$Approach <- "Approach 1"
+  data2$Approach <- "Approach 2"
+  
+  # Combine and standardize column name
+  combined_data <- rbind(
+    data1[, c(column_name, "Approach", "event")],
+    data2[, c(column_name, "Approach", "event")]
+  )
+  colnames(combined_data)[1] <- "Value"
+  
+  # Convert event to labeled factor
+  combined_data$Event <- factor(combined_data$event, labels = c("No Event", "Event"))
+  
+  # Create ordered group factor
+  combined_data$Group <- interaction(combined_data$Approach, combined_data$Event, sep = " - ")
+  combined_data$Group <- factor(combined_data$Group,
+                                levels = c("Approach 1 - No Event", "Approach 1 - Event",
+                                           "Approach 2 - No Event", "Approach 2 - Event"))
+  
+  # Y-axis range for annotation placement
+  min_y <- min(combined_data$Value, na.rm = TRUE)
+  max_y <- max(combined_data$Value, na.rm = TRUE)
+  range_y <- max_y - min_y
+
+  # Determine y-axis label
+  y_label <- if (!is.null(unit_label)) unit_label else column_name
+
+  # Plot
+  p <- ggplot(combined_data, aes(x = Group, y = Value, fill = Event)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(x = NULL, y = y_label) +
+    scale_fill_manual(values = c("No Event" = "steelblue4", "Event" = "steelblue1")) +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      plot.margin = margin(t = 30, b = 30)
+    ) +
+    coord_cartesian(clip = "off") +
+    annotate("text", x = 1.5, y = max_y + 0.05 * range_y,
+             label = "Approach 1", size = 4, fontface = "bold") +
+    annotate("text", x = 3.5, y = max_y + 0.05 * range_y,
+             label = "Approach 2", size = 4, fontface = "bold")
+  #ggsave(paste0("final_plots/comparing_", column_name, ".pdf"), width = 6, height = 4, units = "in")
+  return(p)
+}
+```
+Usage
+```{r}
+visualization_numerical_compare(input_cox, input_cox_trend, "age", unit_label = "Age (years)")
+visualization_numerical_compare(input_cox, input_cox_trend, "val_HbA1c", unit_label = "HbA1c (%)")
+visualization_numerical_compare(input_cox, input_cox_trend, "BMI", unit_label = "BMI (kg/m²)")
+visualization_numerical_compare(input_cox, input_cox_trend, "systolic_blood_pressure", unit_label = "Systolic BP (mmHg)")
+visualization_numerical_compare(input_cox, input_cox_trend, "diastolic_blood_pressure", unit_label = "Diastolic BP (mmHg)")
+visualization_numerical_compare(input_cox, input_cox_trend, "cholesterol_LDL", unit_label = "cholesterol LDL (mg/dL)")
+visualization_numerical_compare(input_cox, input_cox_trend, "triglycerides", unit_label = "Triglycerides (mg/dL)")
+visualization_numerical_compare(input_cox, input_cox_trend, "ACR", unit_label = "ACR (mg/g)")
+
+```
+Save as RDS
+```{r}
+saveRDS(input_cox, file = "/home/niclas/input_cox.rds", compress=TRUE)
+saveRDS(input_cox_trend, file = "/home/niclas/input_cox_trend.rds", compress=TRUE)
+```
+Display time-to-event comparatively
+```{r}
+df_combined <- rbind(
+  data.frame(time_to_event = input_cox$time_to_event, Source = "Approach 1"),
+  data.frame(time_to_event = input_cox_trend$time_to_event, Source = "Approach 2")
+)
+
+# Compute range for annotation placement
+min_y <- min(df_combined$time_to_event, na.rm = TRUE)
+max_y <- max(df_combined$time_to_event, na.rm = TRUE)
+range_y <- max_y - min_y
+
+# Create the plot
+p <- ggplot(df_combined, aes(x = Source, y = time_to_event, fill = Source)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(x = NULL, y = "Time (days)") +
+  scale_fill_manual(values = c("Approach 1" = "steelblue4", "Approach 2" = "steelblue1")) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),  # remove x-axis labels
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin = margin(t = 30, b = 30)
+  ) +
+  coord_cartesian(clip = "off") +
+  annotate("text", x = 1, y = max_y + 0.05 * range_y, label = "Approach 1", size = 4, fontface = "bold") +
+  annotate("text", x = 2, y = max_y + 0.05 * range_y, label = "Approach 2", size = 4, fontface = "bold")
+
+# Save the plot
+ggsave("final_plots/comparing_time_to_event.pdf", plot = p, width = 6, height = 4, units = "in")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
